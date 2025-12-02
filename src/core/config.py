@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     SUPPORTED_FORMATS: List[str] = [".wav", ".mp3", ".m4a", ".flac"]
     
     # Paths
-    MODEL_DIR: str = "models"
+    MODEL_DIR: str = "models/model_1"
     
     # ML Model settings (from your notebook)
     MAX_SEQUENCE_LENGTH: int = 100

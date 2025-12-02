@@ -1,10 +1,8 @@
 import whisper
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 import logging
 from dataclasses import dataclass
-
-from src.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -19,96 +17,95 @@ class TranscriptionResult:
 class STTService:
     """Speech-to-Text service using OpenAI Whisper"""
     
-    _instance = None
-    _model = None
+    def __init__(self, model_name: str = "base"):
+        self.model_name = model_name
+        self.model = None
+        self._load_model()
     
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialize_model()
-        return cls._instance
+    def _load_model(self):
+        """Load Whisper model"""
+        try:
+            logger.info(f"Loading Whisper model: {self.model_name}")
+            self.model = whisper.load_model(self.model_name)
+            logger.info("Whisper model loaded successfully")
+        except Exception as e:
+            logger.error(f"Failed to load Whisper model: {e}")
+            raise
     
-    def _initialize_model(self):
-        """Lazy load Whisper model"""
-        if self._model is None:
-            logger.info(f"Loading Whisper model: {settings.WHISPER_MODEL}")
-            self._model = whisper.load_model(
-                settings.WHISPER_MODEL,
-                device=settings.WHISPER_DEVICE
-            )
-            logger.info(f"Whisper model loaded successfully")
-    
-    def transcribe(self, audio_array: np.ndarray, sample_rate: int = 16000) -> TranscriptionResult:
-        """
-        Transcribe audio to text.
-        
-        Args:
-            audio_array: Audio signal as numpy array
-            sample_rate: Sample rate of audio
+    def transcribe_file(self, audio_path: str) -> TranscriptionResult:
+        """Transcribe audio file to text"""
+        try:
+            result = self.model.transcribe(audio_path, fp16=False)
             
-        Returns:
-            TranscriptionResult object
-        """
+            # Calculate average confidence from segments
+            segments = result.get('segments', [])
+            if segments:
+                confidence = np.mean([seg.get('no_speech_prob', 0.5) for seg in segments])
+                confidence = 1.0 - confidence  # Convert no_speech_prob to confidence
+            else:
+                confidence = 0.5
+            
+            return TranscriptionResult(
+                text=result.get('text', '').strip(),
+                language=result.get('language', 'en'),
+                confidence=float(confidence),
+                segments=segments
+            )
+            
+        except Exception as e:
+            logger.error(f"Transcription failed: {e}")
+            raise Exception(f"Transcription error: {e}")
+    
+    def transcribe_array(self, audio_array: np.ndarray) -> TranscriptionResult:
+        """Transcribe audio array to text"""
         try:
             # Ensure audio is float32 and normalized
             audio = audio_array.astype(np.float32)
             if audio.max() > 1.0:
                 audio = audio / np.max(np.abs(audio))
             
-            # Transcribe with Whisper
-            result = self._model.transcribe(
-                audio,
-                language=None,  # Auto-detect language
-                task="transcribe",
-                fp16=False,  # Use FP32 for CPU compatibility
-                verbose=False
-            )
+            result = self.model.transcribe(audio, fp16=False)
             
-            # Calculate average confidence from segments
-            confidence = np.mean([seg.get('confidence', 0.5) for seg in result.get('segments', [])])
+            segments = result.get('segments', [])
+            if segments:
+                confidence = np.mean([1.0 - seg.get('no_speech_prob', 0.5) for seg in segments])
+            else:
+                confidence = 0.5
             
             return TranscriptionResult(
-                text=result.get('text', ''),
+                text=result.get('text', '').strip(),
                 language=result.get('language', 'en'),
                 confidence=float(confidence),
-                segments=result.get('segments', []),
-                word_timestamps=result.get('word_timestamps', None)
+                segments=segments
             )
             
         except Exception as e:
-            logger.error(f"Transcription failed: {str(e)}")
-            raise Exception(f"Transcription error: {str(e)}")
+            logger.error(f"Transcription failed: {e}")
+            raise Exception(f"Transcription error: {e}")
     
     def detect_phishing_keywords(self, transcription: str) -> Dict[str, float]:
-        """
-        Scan transcription for common phishing keywords.
-        """
+        """Scan transcription for common phishing keywords"""
         phishing_keywords = {
             # Urgency keywords
-            'urgent': 0.8,
-            'immediately': 0.9,
-            'now': 0.7,
-            'emergency': 0.9,
-            'limited time': 0.85,
+            'urgent': 0.8, 'immediately': 0.9, 'now': 0.7, 'emergency': 0.9,
+            'limited time': 0.85, 'expires': 0.7, 'deadline': 0.8,
             
             # Financial keywords
-            'bank account': 0.8,
-            'password': 0.6,
-            'credit card': 0.9,
-            'social security': 0.95,
-            'verify': 0.7,
+            'bank account': 0.8, 'password': 0.6, 'credit card': 0.9,
+            'social security': 0.95, 'verify': 0.7, 'confirm': 0.6,
+            'update': 0.5, 'suspend': 0.8, 'freeze': 0.8,
             
             # Authority keywords
-            'government': 0.6,
-            'police': 0.7,
-            'IRS': 0.9,
-            'FBI': 0.8,
+            'government': 0.6, 'police': 0.7, 'irs': 0.9, 'fbi': 0.8,
+            'court': 0.7, 'legal': 0.6, 'official': 0.5,
             
             # Threat keywords
-            'arrest': 0.85,
-            'lawsuit': 0.7,
-            'fine': 0.75,
-            'jail': 0.8,
+            'arrest': 0.85, 'lawsuit': 0.7, 'fine': 0.75, 'jail': 0.8,
+            'penalty': 0.7, 'charges': 0.8, 'investigation': 0.7,
+            
+            # Action keywords
+            'click': 0.6, 'call back': 0.7, 'press': 0.5, 'transfer': 0.8,
+            'provide': 0.6, 'give me': 0.7, 'tell me': 0.6
         }
         
         text_lower = transcription.lower()
@@ -116,7 +113,6 @@ class STTService:
         
         for keyword, weight in phishing_keywords.items():
             if keyword in text_lower:
-                # Count occurrences
                 count = text_lower.count(keyword)
                 score = min(weight * (1 + 0.2 * (count - 1)), 1.0)
                 detected[keyword] = score

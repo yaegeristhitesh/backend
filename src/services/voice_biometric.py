@@ -1,325 +1,264 @@
 import numpy as np
-import torch
-import torch.nn as nn
-from typing import Dict, List, Optional, Tuple
-import pickle
+import json
 import os
+from typing import Dict, List, Optional, Tuple
 import logging
-from dataclasses import dataclass
-from datetime import datetime
-from scipy.spatial.distance import cosine, euclidean
-import hashlib
+from pathlib import Path
 
-from src.core.config import settings
-from src.models.cnn_speaker import VoiceCNN
+from ..model.cnn_speaker import SpeakerEmbeddingExtractor
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class VoicePrint:
-    """Voice biometric template"""
-    speaker_id: str
-    embedding: np.ndarray
-    metadata: Dict
-    confidence: float
-    created_at: datetime
-    scammer_flag: bool = False
-    scam_count: int = 0
-    
-    def get_hash(self) -> str:
-        """Get unique hash for this voiceprint"""
-        data = f"{self.speaker_id}_{self.embedding.tobytes().hex()}"
-        return hashlib.sha256(data.encode()).hexdigest()[:16]
-
 class VoiceBiometricService:
-    """CNN-based voice biometric system (implementing paper concepts)"""
+    """Voice biometric service for scammer identification"""
     
-    _instance = None
-    _model = None
-    _database = {}  # speaker_id -> VoicePrint
-    _scammer_db = {}  # biometric_hash -> scammer_data
-    
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-    
-    @classmethod
-    def initialize(cls):
-        """Initialize the service"""
-        if cls._instance is None:
-            cls._instance = cls()
-            cls._instance._load_model()
-            cls._instance._load_database()
-    
-    def _load_model(self):
-        """Load CNN model for voice recognition"""
-        self.model = VoiceCNN(
-            num_speakers=50,
-            feature_dim=settings.MFCC_FEATURES * 4  # MFCC + delta + delta-delta + filterbank
-        )
+    def __init__(self, database_path: str = "data/scammer_db.json"):
+        self.database_path = Path(database_path)
+        self.embedding_extractor = SpeakerEmbeddingExtractor()
+        self.scammer_database = self._load_database()
+        self.similarity_threshold = 0.75  # Threshold for scammer match
         
-        # Load pre-trained weights if available
-        model_path = "models/voice_cnn.pth"
-        if os.path.exists(model_path):
-            self.model.load_state_dict(torch.load(model_path))
-            logger.info("Loaded pre-trained CNN model")
-        
-        self.model.eval()
-        
-    def _load_database(self):
-        """Load voiceprint database from file"""
-        db_path = "data/voiceprints.pkl"
-        if os.path.exists(db_path):
-            try:
-                with open(db_path, 'rb') as f:
-                    self._database = pickle.load(f)
-                logger.info(f"Loaded {len(self._database)} voiceprints from database")
-            except Exception as e:
-                logger.error(f"Failed to load database: {e}")
+    def _load_database(self) -> Dict:
+        """Load scammer voice database"""
+        try:
+            if self.database_path.exists():
+                with open(self.database_path, 'r') as f:
+                    db = json.load(f)
+                logger.info(f"Loaded scammer database with {len(db)} entries")
+                return db
+            else:
+                logger.info("Creating new scammer database")
+                # Create directory if it doesn't exist
+                self.database_path.parent.mkdir(parents=True, exist_ok=True)
+                return {}
+        except Exception as e:
+            logger.error(f"Failed to load database: {e}")
+            return {}
     
     def _save_database(self):
-        """Save voiceprint database to file"""
-        os.makedirs("data", exist_ok=True)
-        db_path = "data/voiceprints.pkl"
+        """Save scammer database to file"""
         try:
-            with open(db_path, 'wb') as f:
-                pickle.dump(self._database, f)
-            logger.info(f"Saved {len(self._database)} voiceprints to database")
+            with open(self.database_path, 'w') as f:
+                json.dump(self.scammer_database, f, indent=2)
+            logger.info("Scammer database saved")
         except Exception as e:
             logger.error(f"Failed to save database: {e}")
     
-    def extract_embedding(self, mfcc_features: np.ndarray) -> np.ndarray:
+    def analyze_voice(self, mfcc_features: List[List[float]], request_id: str = None) -> Dict:
         """
-        Extract voice embedding using CNN model.
+        Analyze voice for known scammer patterns
         
         Args:
-            mfcc_features: MFCC features (n_frames, n_features)
+            mfcc_features: MFCC features from audio
+            request_id: Request ID for tracking
             
         Returns:
-            Normalized embedding vector
+            Analysis results with scammer match info
         """
         try:
-            # Ensure correct shape
-            if len(mfcc_features.shape) == 2:
-                # Add batch dimension and channel dimension
-                features_tensor = torch.FloatTensor(mfcc_features).unsqueeze(0).unsqueeze(0)
+            # Convert to numpy array
+            mfcc_array = np.array(mfcc_features)
+            
+            if mfcc_array.size == 0:
+                return {
+                    "is_known_scammer": False,
+                    "confidence": 0.0,
+                    "matched_scammer_id": None,
+                    "similarity_score": 0.0,
+                    "error": "Empty MFCC features",
+                    "embedding": None
+                }
+            
+            # Extract speaker embedding
+            embedding = self.embedding_extractor.extract_embedding(mfcc_array)
+            
+            # Check against known scammers
+            best_match = self._find_best_match(embedding)
+            
+            if best_match:
+                scammer_id, similarity = best_match
+                is_scammer = similarity >= self.similarity_threshold
+                
+                # Update activity if matched
+                if is_scammer:
+                    self.update_scammer_activity(scammer_id)
+                
+                return {
+                    "is_known_scammer": is_scammer,
+                    "confidence": similarity,
+                    "matched_scammer_id": scammer_id if is_scammer else None,
+                    "similarity_score": similarity,
+                    "threshold": self.similarity_threshold,
+                    "embedding_dim": len(embedding),
+                    "embedding": embedding.tolist()  # For adaptive learning
+                }
             else:
-                features_tensor = torch.FloatTensor(mfcc_features).unsqueeze(0)
+                return {
+                    "is_known_scammer": False,
+                    "confidence": 0.0,
+                    "matched_scammer_id": None,
+                    "similarity_score": 0.0,
+                    "threshold": self.similarity_threshold,
+                    "embedding_dim": len(embedding),
+                    "embedding": embedding.tolist()  # For adaptive learning
+                }
+                
+        except Exception as e:
+            logger.error(f"Voice analysis failed: {e}")
+            return {
+                "is_known_scammer": False,
+                "confidence": 0.0,
+                "matched_scammer_id": None,
+                "similarity_score": 0.0,
+                "error": str(e),
+                "embedding": None
+            }
+    
+    def _find_best_match(self, embedding: np.ndarray) -> Optional[Tuple[str, float]]:
+        """Find best matching scammer in database"""
+        if not self.scammer_database:
+            return None
+        
+        best_similarity = 0.0
+        best_scammer_id = None
+        
+        for scammer_id, scammer_data in self.scammer_database.items():
+            stored_embedding = np.array(scammer_data["embedding"])
+            similarity = self.embedding_extractor.compute_similarity(embedding, stored_embedding)
             
-            # Extract embedding
-            with torch.no_grad():
-                embedding = self.model.extract_embedding(features_tensor)
-                embedding = embedding.numpy().flatten()
+            if similarity > best_similarity:
+                best_similarity = similarity
+                best_scammer_id = scammer_id
+        
+        return (best_scammer_id, best_similarity) if best_similarity > 0 else None
+    
+    def add_scammer(self, scammer_id: str, mfcc_features: List[List[float]], 
+                   metadata: Dict = None) -> bool:
+        """
+        Add a new scammer to the database
+        
+        Args:
+            scammer_id: Unique identifier for the scammer
+            mfcc_features: MFCC features from scammer's voice
+            metadata: Additional information about the scammer
             
-            # Normalize
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
+        Returns:
+            Success status
+        """
+        try:
+            mfcc_array = np.array(mfcc_features)
+            embedding = self.embedding_extractor.extract_embedding(mfcc_array)
             
-            return embedding
+            self.scammer_database[scammer_id] = {
+                "embedding": embedding.tolist(),
+                "metadata": metadata or {},
+                "added_timestamp": str(np.datetime64('now')),
+                "call_count": 1
+            }
+            
+            self._save_database()
+            logger.info(f"Added scammer {scammer_id} to database")
+            return True
             
         except Exception as e:
-            logger.error(f"Failed to extract embedding: {e}")
-            raise
+            logger.error(f"Failed to add scammer: {e}")
+            return False
     
-    async def enroll_speaker(self, speaker_id: str, audio_features: Dict, 
-                           metadata: Optional[Dict] = None) -> VoicePrint:
-        """
-        Enroll a new speaker in the system.
-        """
-        # Extract MFCC features
-        mfcc = audio_features.get("mfcc")
-        if mfcc is None or len(mfcc) == 0:
-            raise ValueError("No MFCC features available")
+    def update_scammer_activity(self, scammer_id: str):
+        """Update activity count for known scammer"""
+        if scammer_id in self.scammer_database:
+            self.scammer_database[scammer_id]["call_count"] += 1
+            self.scammer_database[scammer_id]["last_seen"] = str(np.datetime64('now'))
+            self._save_database()
+    
+    def get_scammer_stats(self) -> Dict:
+        """Get statistics about known scammers"""
+        if not self.scammer_database:
+            return {
+                "total_scammers": 0,
+                "total_calls": 0,
+                "most_active": None
+            }
         
-        # Extract embedding
-        embedding = self.extract_embedding(mfcc)
-        
-        # Calculate enrollment quality
-        confidence = self._calculate_enrollment_confidence(embedding)
-        
-        # Create voiceprint
-        voiceprint = VoicePrint(
-            speaker_id=speaker_id,
-            embedding=embedding,
-            metadata=metadata or {},
-            confidence=confidence,
-            created_at=datetime.now(),
-            scammer_flag=False
+        total_calls = sum(data.get("call_count", 1) for data in self.scammer_database.values())
+        most_active = max(
+            self.scammer_database.items(),
+            key=lambda x: x[1].get("call_count", 1)
         )
         
-        # Store in database
-        self._database[speaker_id] = voiceprint
-        self._save_database()
-        
-        logger.info(f"Enrolled speaker: {speaker_id} (confidence: {confidence:.3f})")
-        return voiceprint
-    
-    async def enroll_scammer(self, speaker_id: str, audio_features: Dict,
-                           metadata: Optional[Dict] = None) -> VoicePrint:
-        """
-        Enroll a known scammer into the database.
-        """
-        voiceprint = await self.enroll_speaker(speaker_id, audio_features, metadata)
-        voiceprint.scammer_flag = True
-        
-        # Add to scammer-specific database
-        voice_hash = voiceprint.get_hash()
-        self._scammer_db[voice_hash] = {
-            "speaker_id": speaker_id,
-            "embedding": voiceprint.embedding,
-            "metadata": voiceprint.metadata,
-            "enrollment_date": datetime.now()
-        }
-        
-        logger.warning(f"Enrolled scammer: {speaker_id}")
-        return voiceprint
-    
-    async def verify_speaker(self, claimed_id: str, audio_features: Dict) -> Dict:
-        """
-        Verify if audio matches claimed speaker.
-        """
-        if claimed_id not in self._database:
-            return {
-                "verified": False,
-                "confidence": 0.0,
-                "error": "Speaker not enrolled",
-                "similarity": 0.0
-            }
-        
-        # Get stored voiceprint
-        stored = self._database[claimed_id]
-        
-        # Extract embedding from current audio
-        mfcc = audio_features.get("mfcc")
-        if mfcc is None:
-            return {
-                "verified": False,
-                "confidence": 0.0,
-                "error": "No audio features",
-                "similarity": 0.0
-            }
-        
-        current_embedding = self.extract_embedding(mfcc)
-        
-        # Calculate similarity (cosine similarity)
-        similarity = 1 - cosine(current_embedding, stored.embedding)
-        
-        # Calculate verification confidence
-        confidence = self._calculate_verification_confidence(
-            similarity, 
-            stored.confidence
-        )
-        
-        # Check against threshold
-        verified = similarity >= settings.CONFIDENCE_THRESHOLD
-        
         return {
-            "verified": verified,
-            "similarity": float(similarity),
-            "confidence": float(confidence),
-            "threshold": settings.CONFIDENCE_THRESHOLD,
-            "speaker_id": claimed_id
+            "total_scammers": len(self.scammer_database),
+            "total_calls": total_calls,
+            "most_active": {
+                "id": most_active[0],
+                "calls": most_active[1].get("call_count", 1)
+            }
         }
     
-    async def identify_speaker(self, audio_features: Dict) -> Dict:
+    def adaptive_learn_scammer(self, embedding: List[float], scam_type: str = "Unknown", 
+                              confidence_threshold: float = 0.8) -> bool:
         """
-        Identify speaker from audio (1:N matching).
-        """
-        mfcc = audio_features.get("mfcc")
-        if mfcc is None or len(self._database) == 0:
-            return {
-                "identified": False,
-                "matches": [],
-                "best_match": None
-            }
+        Adaptively learn new scammer from high-confidence phishing detection
         
-        current_embedding = self.extract_embedding(mfcc)
-        
-        # Compare against all enrolled speakers
-        matches = []
-        for speaker_id, voiceprint in self._database.items():
-            similarity = 1 - cosine(current_embedding, voiceprint.embedding)
+        Args:
+            embedding: Voice embedding from confirmed phishing call
+            scam_type: Type of scam detected
+            confidence_threshold: Minimum confidence to add to database
             
-            if similarity >= settings.CONFIDENCE_THRESHOLD:
-                matches.append({
-                    "speaker_id": speaker_id,
-                    "similarity": float(similarity),
-                    "is_scammer": voiceprint.scammer_flag,
-                    "enrollment_date": voiceprint.created_at.isoformat()
-                })
-        
-        # Sort by similarity
-        matches.sort(key=lambda x: x["similarity"], reverse=True)
-        
-        return {
-            "identified": len(matches) > 0,
-            "matches": matches,
-            "best_match": matches[0] if matches else None,
-            "total_comparisons": len(self._database)
-        }
-    
-    async def detect_known_scammer(self, audio_features: Dict) -> Dict:
+        Returns:
+            True if scammer was added to database
         """
-        Check if voice matches any known scammer.
-        """
-        mfcc = audio_features.get("mfcc")
-        if mfcc is None or len(self._scammer_db) == 0:
-            return {
-                "is_scammer": False,
-                "confidence": 0.0,
-                "matches": []
-            }
-        
-        current_embedding = self.extract_embedding(mfcc)
-        
-        scammer_matches = []
-        for scammer_hash, scammer_data in self._scammer_db.items():
-            scammer_embedding = scammer_data["embedding"]
-            similarity = 1 - cosine(current_embedding, scammer_embedding)
+        try:
+            embedding_array = np.array(embedding)
             
-            if similarity >= settings.SCAM_THRESHOLD:
-                scammer_matches.append({
-                    "scammer_id": scammer_data["speaker_id"],
-                    "similarity": float(similarity),
-                    "metadata": scammer_data.get("metadata", {}),
-                    "hash": scammer_hash
-                })
-        
-        is_scammer = len(scammer_matches) > 0
+            # Check if this voice is already similar to known scammers
+            best_match = self._find_best_match(embedding_array)
+            
+            if best_match and best_match[1] >= self.similarity_threshold:
+                # Already known scammer, just update activity
+                self.update_scammer_activity(best_match[0])
+                logger.info(f"Updated activity for known scammer: {best_match[0]}")
+                return False
+            
+            # Generate new scammer ID
+            scammer_count = len([k for k in self.scammer_database.keys() if k.startswith('adaptive_')])
+            new_scammer_id = f"adaptive_scammer_{scammer_count + 1:03d}"
+            
+            # Add to database
+            self.scammer_database[new_scammer_id] = {
+                "embedding": embedding,
+                "metadata": {
+                    "description": f"Adaptively learned scammer - {scam_type}",
+                    "scam_type": scam_type,
+                    "learning_method": "adaptive",
+                    "first_detected": str(np.datetime64('now'))
+                },
+                "added_timestamp": str(np.datetime64('now')),
+                "call_count": 1,
+                "last_seen": str(np.datetime64('now'))
+            }
+            
+            self._save_database()
+            logger.info(f"Adaptively learned new scammer: {new_scammer_id} ({scam_type})")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Adaptive learning failed: {e}")
+            return False
+    
+    def get_service_info(self) -> Dict:
+        """Get service information"""
+        adaptive_count = len([k for k in self.scammer_database.keys() if k.startswith('adaptive_')])
         
         return {
-            "is_scammer": is_scammer,
-            "confidence": max([m["similarity"] for m in scammer_matches]) if scammer_matches else 0.0,
-            "matches": scammer_matches,
-            "total_scammers_checked": len(self._scammer_db)
-        }
-    
-    def _calculate_enrollment_confidence(self, embedding: np.ndarray) -> float:
-        """Calculate confidence in enrollment quality"""
-        # Check embedding norm
-        norm = np.linalg.norm(embedding)
-        if norm < 0.1:
-            return 0.3
-        
-        # Check embedding stability (if we had multiple samples)
-        return min(0.7 + norm * 0.3, 1.0)
-    
-    def _calculate_verification_confidence(self, similarity: float, 
-                                         enrollment_confidence: float) -> float:
-        """Calculate overall verification confidence"""
-        # Weight similarity more heavily
-        return 0.7 * similarity + 0.3 * enrollment_confidence
-    
-    def get_database_stats(self) -> Dict:
-        """Get database statistics"""
-        total = len(self._database)
-        scammers = sum(1 for v in self._database.values() if v.scammer_flag)
-        
-        return {
-            "total_speakers": total,
-            "known_scammers": scammers,
-            "legitimate_speakers": total - scammers,
-            "average_confidence": np.mean([v.confidence for v in self._database.values()]) if total > 0 else 0
+            "service_name": "Voice Biometric Service (Adaptive)",
+            "model_info": self.embedding_extractor.get_model_info(),
+            "database_stats": self.get_scammer_stats(),
+            "similarity_threshold": self.similarity_threshold,
+            "database_path": str(self.database_path),
+            "adaptive_learning": {
+                "enabled": True,
+                "learned_scammers": adaptive_count,
+                "total_scammers": len(self.scammer_database)
+            }
         }

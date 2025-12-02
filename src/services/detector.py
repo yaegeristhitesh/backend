@@ -3,15 +3,9 @@ from typing import Dict, List, Optional
 import logging
 from datetime import datetime
 
-from src.api.schemas import AudioAnalysisRequest, AudioAnalysisResponse
-from src.services.stt_service import STTService
-from src.models.phishing_models import (
-    LinguisticAnalyzer, 
-    URLDetector, 
-    UrgencyScorer
-)
-from src.services.voice_biometric import VoiceBiometricService
-from src.core.config import settings
+from .stt_service import STTService
+from .ml_model_service import MLModelService
+from .voice_biometric import VoiceBiometricService
 
 logger = logging.getLogger(__name__)
 
@@ -20,220 +14,245 @@ class PhishingDetector:
     
     def __init__(self):
         self.stt_service = STTService()
-        self.linguistic_analyzer = LinguisticAnalyzer()
-        self.url_detector = URLDetector()
-        self.urgency_scorer = UrgencyScorer()
+        self.ml_model_service = MLModelService()
         self.biometric_service = VoiceBiometricService()
         
-        self.models = {
-            "linguistic": self.linguistic_analyzer,
-            "url_detector": self.url_detector,
-            "urgency_scorer": self.urgency_scorer,
-        }
-    
-    async def analyze(self, audio_data: Dict, request_id: str, 
-                     config: AudioAnalysisRequest) -> AudioAnalysisResponse:
-        """
-        Main analysis pipeline.
-        """
+    async def analyze(self, audio_data: Dict, request_id: str) -> Dict:
+        """Main analysis pipeline"""
         logger.info(f"[{request_id}] Starting analysis pipeline")
         
-        # Extract audio array for STT
-        audio_array = audio_data.get("audio_array")
-        if audio_array is None:
-            raise ValueError("No audio data available")
-        
-        # Step 1: Speech-to-Text
-        logger.debug(f"[{request_id}] Starting transcription")
-        transcription_result = self.stt_service.transcribe(
-            audio_array,
-            sample_rate=audio_data["sample_rate"]
-        )
-        
-        transcript = transcription_result.text if config.require_transcript else None
-        
-        # Step 2: Run detection models in parallel
-        logger.debug(f"[{request_id}] Running detection models")
-        model_tasks = []
-        
-        # Add enabled models to tasks
-        for model_name, model in self.models.items():
-            if model_name in settings.ENABLED_MODELS:
-                task = asyncio.create_task(
-                    self._run_model(model, model_name, transcription_result.text)
-                )
-                model_tasks.append((model_name, task))
-        
-        # Step 3: Voice biometric check (if enabled)
-        biometric_result = None
-        if config.enable_biometric_check:
-            logger.debug(f"[{request_id}] Running biometric check")
-            biometric_task = asyncio.create_task(
-                self.biometric_service.detect_known_scammer(audio_data["features"])
-            )
-        else:
-            biometric_task = None
-        
-        # Wait for all models to complete
-        model_results = {}
-        for model_name, task in model_tasks:
-            try:
-                result = await task
-                model_results[model_name] = result
-            except Exception as e:
-                logger.error(f"[{request_id}] Model {model_name} failed: {e}")
-                model_results[model_name] = self._create_failed_result(model_name)
-        
-        # Wait for biometric result if enabled
-        if biometric_task:
-            try:
-                biometric_result = await biometric_task
-            except Exception as e:
-                logger.error(f"[{request_id}] Biometric check failed: {e}")
-                biometric_result = {"is_scammer": False, "confidence": 0.0}
-        
-        # Step 4: Aggregate results
-        logger.debug(f"[{request_id}] Aggregating results")
-        aggregated = self._aggregate_results(
-            model_results, 
-            biometric_result,
-            transcription_result.confidence
-        )
-        
-        # Step 5: Create response
-        response = AudioAnalysisResponse(
-            request_id=request_id,
-            status="completed",
-            transcript=transcript,
-            is_phishing=aggregated["is_phishing"],
-            overall_confidence=aggregated["overall_confidence"],
-            processing_time_ms=0,  # Will be set by endpoint
-            warnings=aggregated["warnings"],
-            biometric_match=aggregated.get("biometric_match"),
-            model_breakdown=aggregated["model_scores"],
-            audio_metadata={
-                "duration": audio_data["duration_seconds"],
-                "sample_rate": audio_data["sample_rate"],
-                "format": audio_data["original_format"],
-                "speech_ratio": audio_data["features"].get("speech_ratio", 0)
-            },
-            risk_score=aggregated["risk_score"]
-        )
-        
-        logger.info(f"[{request_id}] Analysis complete - Phishing: {response.is_phishing}")
-        return response
-    
-    async def _run_model(self, model, model_name: str, text: str):
-        """Run a single detection model"""
         try:
-            result = model.analyze(text)
-            return result
+            # Step 1: Speech-to-Text
+            logger.debug(f"[{request_id}] Starting transcription")
+            audio_array = audio_data.get("audio_array")
+            if audio_array is None:
+                raise ValueError("No audio data available")
+            
+            transcription_result = self.stt_service.transcribe_array(audio_array)
+            transcript = transcription_result.text
+            
+            # Step 2: Run detection models in parallel
+            logger.debug(f"[{request_id}] Running detection models")
+            
+            # ML Model prediction
+            ml_task = asyncio.create_task(
+                self._run_ml_model(transcript)
+            )
+            
+            # Rule-based detection
+            rule_task = asyncio.create_task(
+                self._run_rule_based_detection(transcript)
+            )
+            
+            # Voice biometric check
+            biometric_task = asyncio.create_task(
+                self._run_biometric_check(audio_data["features"], request_id)
+            )
+            
+            # Wait for all tasks
+            ml_result, rule_result, biometric_result = await asyncio.gather(
+                ml_task, rule_task, biometric_task, return_exceptions=True
+            )
+            
+            # Handle exceptions
+            if isinstance(ml_result, Exception):
+                logger.error(f"ML model failed: {ml_result}")
+                ml_result = {"confidence": 0.0, "is_phishing": False, "error": str(ml_result)}
+            
+            if isinstance(rule_result, Exception):
+                logger.error(f"Rule-based detection failed: {rule_result}")
+                rule_result = {"confidence": 0.0, "warnings": [], "error": str(rule_result)}
+            
+            if isinstance(biometric_result, Exception):
+                logger.error(f"Biometric check failed: {biometric_result}")
+                biometric_result = {"is_known_scammer": False, "confidence": 0.0, "error": str(biometric_result)}
+            
+            # Step 3: Aggregate results
+            logger.debug(f"[{request_id}] Aggregating results")
+            aggregated = self._aggregate_results(
+                ml_result, rule_result, biometric_result, transcription_result.confidence
+            )
+            
+            # Adaptive learning: If high-confidence phishing detected, learn the voice pattern
+            if (aggregated["is_phishing"] and aggregated["overall_confidence"] >= 0.7 and 
+                biometric_result.get('embedding') and 
+                not biometric_result.get('is_known_scammer', False)):
+                
+                # Determine scam type from rule-based detection
+                scam_type = "Unknown"
+                if rule_result.get('keywords_detected'):
+                    keywords = rule_result['keywords_detected']
+                    if any('irs' in k.lower() for k in keywords):
+                        scam_type = "IRS Scam"
+                    elif any('bank' in k.lower() for k in keywords):
+                        scam_type = "Banking Fraud"
+                    elif any(k.lower() in ['microsoft', 'tech', 'computer'] for k in keywords):
+                        scam_type = "Tech Support Scam"
+                    else:
+                        scam_type = "General Phishing"
+                
+                # Learn this scammer's voice
+                learned = self.biometric_service.adaptive_learn_scammer(
+                    biometric_result['embedding'], scam_type, aggregated["overall_confidence"]
+                )
+                
+                if learned:
+                    logger.info(f"[{request_id}] Adaptively learned new scammer: {scam_type}")
+            
+            # Step 4: Create response
+            response = {
+                "request_id": request_id,
+                "status": "completed",
+                "transcript": transcript,
+                "transcription_confidence": transcription_result.confidence,
+                "is_phishing": aggregated["is_phishing"],
+                "overall_confidence": aggregated["overall_confidence"],
+                "risk_score": aggregated["risk_score"],
+                "warnings": aggregated["warnings"],
+                "biometric_match": aggregated.get("biometric_match"),
+                "model_breakdown": {
+                    "ml_model": ml_result,
+                    "rule_based": rule_result,
+                    "voice_biometric": {k: v for k, v in biometric_result.items() if k != 'embedding'}  # Exclude embedding from response
+                },
+                "audio_metadata": {
+                    "duration": audio_data["duration_seconds"],
+                    "sample_rate": audio_data["sample_rate"],
+                    "format": audio_data["original_format"],
+                    "speech_ratio": audio_data["features"].get("speech_ratio", 0)
+                }
+            }
+            
+            logger.info(f"[{request_id}] Analysis complete - Phishing: {response['is_phishing']}")
+            return response
+            
         except Exception as e:
-            logger.error(f"Model {model_name} failed: {e}")
-            return self._create_failed_result(model_name)
+            logger.error(f"[{request_id}] Analysis failed: {e}")
+            return {
+                "request_id": request_id,
+                "status": "failed",
+                "error": str(e),
+                "is_phishing": False,
+                "overall_confidence": 0.0
+            }
     
-    def _create_failed_result(self, model_name: str):
-        """Create a fallback result for failed models"""
-        from src.models.phishing_models import DetectionResult
+    async def _run_ml_model(self, transcript: str) -> Dict:
+        """Run ML model prediction"""
+        try:
+            return self.ml_model_service.predict(transcript)
+        except Exception as e:
+            logger.error(f"ML model prediction failed: {e}")
+            return {"confidence": 0.0, "is_phishing": False, "error": str(e)}
+    
+    async def _run_rule_based_detection(self, transcript: str) -> Dict:
+        """Run rule-based phishing detection"""
+        try:
+            # Keyword detection
+            keywords = self.stt_service.detect_phishing_keywords(transcript)
+            
+            # Calculate confidence based on keywords
+            if keywords:
+                confidence = min(sum(keywords.values()) / len(keywords), 1.0)
+                warnings = [f"Detected: {keyword} (score: {score:.2f})" 
+                           for keyword, score in keywords.items()]
+            else:
+                confidence = 0.0
+                warnings = []
+            
+            return {
+                "confidence": confidence,
+                "keywords_detected": keywords,
+                "warnings": warnings,
+                "model_name": "Rule-based Detection"
+            }
+            
+        except Exception as e:
+            logger.error(f"Rule-based detection failed: {e}")
+            return {"confidence": 0.0, "warnings": [], "error": str(e)}
+    
+    async def _run_biometric_check(self, audio_features: Dict, request_id: str) -> Dict:
+        """Run voice biometric check"""
+        try:
+            mfcc_features = audio_features.get("mfcc", [])
+            if not mfcc_features:
+                return {"is_known_scammer": False, "confidence": 0.0, "error": "No MFCC features"}
+            
+            return self.biometric_service.analyze_voice(mfcc_features, request_id)
+            
+        except Exception as e:
+            logger.error(f"Biometric check failed: {e}")
+            return {"is_known_scammer": False, "confidence": 0.0, "error": str(e)}
+    
+    def _aggregate_results(self, ml_result: Dict, rule_result: Dict, 
+                          biometric_result: Dict, transcription_confidence: float) -> Dict:
+        """Aggregate results from all models into final decision"""
         
-        return DetectionResult(
-            model_name=model_name,
-            confidence=0.0,
-            indicators=["Model execution failed"],
-            explanation=f"{model_name} model failed to execute",
-            metadata={"status": "failed"}
-        )
-    
-    def _aggregate_results(self, model_results: Dict, biometric_result: Optional[Dict], 
-                          transcription_confidence: float) -> Dict:
-        """
-        Aggregate results from all models into final decision.
-        """
         warnings = []
-        model_scores = {}
-        total_confidence = 0.0
-        active_models = 0
         
-        # Process each model's results
-        for model_name, result in model_results.items():
-            if result.confidence > 0:
-                # Convert DetectionResult to PhishingWarning
-                from src.api.schemas import PhishingWarning, WarningSeverity
-                
-                # Determine severity based on confidence
-                if result.confidence >= 0.8:
-                    severity = WarningSeverity.HIGH
-                elif result.confidence >= 0.6:
-                    severity = WarningSeverity.MEDIUM
-                else:
-                    severity = WarningSeverity.LOW
-                
-                warning = PhishingWarning(
-                    model=model_name,
-                    confidence=result.confidence,
-                    severity=severity,
-                    indicators=result.indicators[:5],  # Limit indicators
-                    explanation=result.explanation,
-                    recommendation=self._get_recommendation(model_name, result.confidence)
-                )
-                warnings.append(warning)
-                
-                # Add to scores
-                model_scores[model_name] = result.confidence
-                total_confidence += result.confidence
-                active_models += 1
+        # ML Model warnings
+        if ml_result.get("is_phishing", False):
+            warnings.append({
+                "model": "CNN-BiLSTM-Attention",
+                "confidence": ml_result.get("confidence", 0.0),
+                "severity": "HIGH" if ml_result.get("confidence", 0) > 0.8 else "MEDIUM",
+                "message": f"ML model detected phishing with {ml_result.get('confidence', 0):.2f} confidence"
+            })
         
-        # Add biometric warning if scammer detected
+        # Rule-based warnings
+        for warning in rule_result.get("warnings", []):
+            warnings.append({
+                "model": "Rule-based",
+                "confidence": rule_result.get("confidence", 0.0),
+                "severity": "MEDIUM",
+                "message": warning
+            })
+        
+        # Biometric warnings
         biometric_match = None
-        if biometric_result and biometric_result.get("is_scammer"):
-            from src.api.schemas import BiometricMatch, PhishingWarning, WarningSeverity
+        if biometric_result.get("is_known_scammer", False):
+            warnings.append({
+                "model": "Voice Biometric",
+                "confidence": biometric_result.get("confidence", 0.0),
+                "severity": "CRITICAL",
+                "message": f"Voice matches known scammer (similarity: {biometric_result.get('similarity_score', 0):.2f})"
+            })
             
-            scammer_matches = biometric_result.get("matches", [])
-            best_match = scammer_matches[0] if scammer_matches else None
-            
-            if best_match:
-                # Create biometric warning
-                warnings.append(PhishingWarning(
-                    model="voice_biometric",
-                    confidence=best_match["similarity"],
-                    severity=WarningSeverity.CRITICAL,
-                    indicators=[f"Known scammer: {best_match['scammer_id']}"],
-                    explanation="Voice matches known scammer in database",
-                    recommendation="Terminate call immediately and report"
-                ))
-                
-                # Add to scores with high weight
-                model_scores["voice_biometric"] = best_match["similarity"]
-                total_confidence += best_match["similarity"] * 2  # Double weight for scammers
-                active_models += 2  # Count biometric as double
-                
-                # Create biometric match info
-                biometric_match = BiometricMatch(
-                    speaker_id=best_match["scammer_id"],
-                    similarity_score=best_match["similarity"],
-                    confidence=best_match["similarity"],
-                    is_known_scammer=True,
-                    scammer_database_match=best_match["scammer_id"]
-                )
+            biometric_match = {
+                "is_known_scammer": True,
+                "similarity_score": biometric_result.get("similarity_score", 0.0),
+                "confidence": biometric_result.get("confidence", 0.0),
+                "scammer_id": biometric_result.get("matched_scammer_id")
+            }
         
         # Calculate overall metrics
-        overall_confidence = total_confidence / active_models if active_models > 0 else 0
+        model_confidences = [
+            ml_result.get("confidence", 0.0),
+            rule_result.get("confidence", 0.0),
+            biometric_result.get("confidence", 0.0) * 2  # Higher weight for biometric
+        ]
         
-        # Adjust confidence based on transcription quality
+        overall_confidence = sum(model_confidences) / len(model_confidences)
+        
+        # Adjust for transcription quality
         if transcription_confidence < 0.5:
-            overall_confidence *= 0.8  # Penalize for poor transcription
+            overall_confidence *= 0.8
         
-        # Calculate risk score (weighted combination)
-        risk_score = self._calculate_risk_score(
-            model_scores, 
-            biometric_result, 
-            overall_confidence
+        # Calculate risk score with weights
+        risk_score = (
+            ml_result.get("confidence", 0.0) * 0.4 +
+            rule_result.get("confidence", 0.0) * 0.3 +
+            biometric_result.get("confidence", 0.0) * 0.3
         )
         
-        # Determine if phishing
+        # Boost risk if biometric match
+        if biometric_result.get("is_known_scammer", False):
+            risk_score = max(risk_score, 0.9)
+        
+        # Determine if phishing (threshold: 0.5)
         is_phishing = (
-            risk_score >= settings.SCAM_THRESHOLD or 
-            (biometric_result and biometric_result.get("is_scammer"))
+            risk_score >= 0.5 or 
+            biometric_result.get("is_known_scammer", False) or
+            ml_result.get("confidence", 0.0) >= 0.7
         )
         
         return {
@@ -241,98 +260,29 @@ class PhishingDetector:
             "overall_confidence": overall_confidence,
             "risk_score": risk_score,
             "warnings": warnings,
-            "model_scores": model_scores,
             "biometric_match": biometric_match
         }
     
-    def _get_recommendation(self, model_name: str, confidence: float) -> str:
-        """Get recommendation based on model and confidence"""
-        recommendations = {
-            "linguistic_analyzer": {
-                "high": "Be cautious of pressure tactics and verify information",
-                "medium": "Verify the source before taking any action",
-                "low": "Standard communication, stay vigilant"
-            },
-            "url_detector": {
-                "high": "Do not click any links, verify website independently",
-                "medium": "Check URL legitimacy before clicking",
-                "low": "Links appear legitimate but verify if unsure"
-            },
-            "urgency_scorer": {
-                "high": "High-pressure tactics detected, likely scam",
-                "medium": "Moderate urgency, verify before acting",
-                "low": "Normal communication pace"
-            }
-        }
-        
-        if confidence >= 0.8:
-            level = "high"
-        elif confidence >= 0.5:
-            level = "medium"
-        else:
-            level = "low"
-        
-        return recommendations.get(model_name, {}).get(level, "Use caution and verify information")
-    
-    def _calculate_risk_score(self, model_scores: Dict, biometric_result: Optional[Dict], 
-                            base_confidence: float) -> float:
-        """Calculate overall risk score"""
-        weights = {
-            "linguistic_analyzer": 0.3,
-            "url_detector": 0.4,
-            "urgency_scorer": 0.3,
-            "voice_biometric": 0.8  # High weight for biometric matches
-        }
-        
-        weighted_sum = 0
-        total_weight = 0
-        
-        for model, score in model_scores.items():
-            weight = weights.get(model, 0.2)
-            weighted_sum += score * weight
-            total_weight += weight
-        
-        # Add biometric penalty if scammer detected
-        if biometric_result and biometric_result.get("is_scammer"):
-            scam_confidence = biometric_result.get("confidence", 0)
-            weighted_sum += scam_confidence * weights["voice_biometric"]
-            total_weight += weights["voice_biometric"]
-        
-        risk_score = weighted_sum / total_weight if total_weight > 0 else base_confidence
-        
-        # Apply non-linear scaling for high scores
-        if risk_score > 0.7:
-            risk_score = 0.7 + (risk_score - 0.7) * 1.5
-        
-        return min(risk_score, 1.0)
-    
     async def get_model_status(self) -> Dict:
         """Get status of all detection models"""
-        status = {}
-        
-        for model_name in settings.ENABLED_MODELS:
-            status[model_name] = {
-                "enabled": True,
-                "status": "operational",
-                "description": self._get_model_description(model_name)
+        try:
+            ml_info = self.ml_model_service.get_model_info()
+            biometric_info = self.biometric_service.get_service_info()
+            
+            return {
+                "ml_model": {
+                    "status": "operational" if ml_info["loaded"] else "failed",
+                    "info": ml_info
+                },
+                "voice_biometric": {
+                    "status": "operational",
+                    "info": biometric_info
+                },
+                "stt_service": {
+                    "status": "operational",
+                    "model": self.stt_service.model_name
+                }
             }
-        
-        # Add biometric service status
-        status["voice_biometric"] = {
-            "enabled": True,
-            "status": "operational",
-            "description": "CNN-based voice biometric verification",
-            "database_size": len(VoiceBiometricService()._database) if hasattr(VoiceBiometricService(), '_database') else 0
-        }
-        
-        return status
-    
-    def _get_model_description(self, model_name: str) -> str:
-        """Get description for a model"""
-        descriptions = {
-            "linguistic": "Analyzes text for phishing linguistic patterns and keywords",
-            "url_detector": "Detects suspicious URLs and domain spoofing attempts",
-            "urgency_scorer": "Identifies urgency and pressure tactics common in scams",
-            "voice_biometric": "CNN-based voice recognition for known scammer detection"
-        }
-        return descriptions.get(model_name, "Unknown model")
+        except Exception as e:
+            logger.error(f"Failed to get model status: {e}")
+            return {"error": str(e)}

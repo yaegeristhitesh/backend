@@ -1,149 +1,151 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple
+import numpy as np
+from typing import Dict, List, Tuple
+import logging
 
-class VoiceCNN(nn.Module):
-    """
-    CNN-based speaker recognition model.
-    Based on: "CNN based speaker recognition in language and text-independent small scale system"
-    Enhanced for phishing detection.
-    """
+logger = logging.getLogger(__name__)
+
+class CNNSpeakerModel(nn.Module):
+    """CNN-based speaker recognition model for voice biometrics"""
     
-    def __init__(self, num_speakers: int = 50, feature_dim: int = 52):
-        """
-        Args:
-            num_speakers: Number of speakers to classify
-            feature_dim: Input feature dimension (MFCC 13 + delta + delta-delta + filterbank)
-        """
+    def __init__(self, input_dim: int = 13, embedding_dim: int = 128):
         super().__init__()
+        self.input_dim = input_dim
+        self.embedding_dim = embedding_dim
         
-        # Convolutional layers (as per paper architecture)
-        # Layer 1: 52 kernels, window size 13
-        self.conv1 = nn.Conv1d(
-            in_channels=1,  # Single channel for MFCC
-            out_channels=52,
-            kernel_size=13,
-            padding=6  # Same padding
-        )
+        # CNN layers for MFCC feature extraction
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=(3, 3), padding=1)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=(3, 3), padding=1)
+        self.conv3 = nn.Conv2d(64, 128, kernel_size=(3, 3), padding=1)
         
-        # Layer 2: 52 kernels, window size 7
-        self.conv2 = nn.Conv1d(
-            in_channels=52,
-            out_channels=52,
-            kernel_size=7,
-            padding=3
-        )
+        # Batch normalization
+        self.bn1 = nn.BatchNorm2d(32)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.bn3 = nn.BatchNorm2d(128)
         
-        # Layer 3: 13 kernels, window size 3
-        self.conv3 = nn.Conv1d(
-            in_channels=52,
-            out_channels=13,
-            kernel_size=3,
-            padding=1
-        )
+        # Pooling layers
+        self.pool = nn.MaxPool2d(2, 2)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 1))
         
-        # Attention mechanism for important frame selection
-        self.attention = nn.MultiheadAttention(
-            embed_dim=13,
-            num_heads=1,
-            batch_first=True
-        )
+        # Fully connected layers
+        self.fc1 = nn.Linear(128, 256)
+        self.fc2 = nn.Linear(256, embedding_dim)
+        self.dropout = nn.Dropout(0.3)
         
-        # Scam detection branch
-        self.scam_detector = nn.Sequential(
-            nn.Linear(13 * 50, 256),  # Flattened features
-            nn.Tanh(),
-            nn.Dropout(0.25),
-            nn.Linear(256, 128),
-            nn.Tanh(),
-            nn.Linear(128, 64),
-            nn.Tanh(),
-        )
-        
-        # Speaker embedding layer
-        self.speaker_embedding = nn.Linear(64, 256)
-        
-        # Classification heads
-        self.speaker_classifier = nn.Linear(256, num_speakers)
-        self.scam_classifier = nn.Linear(256, 2)  # Binary: scam vs legitimate
-        
-        # Batch normalization layers
-        self.bn1 = nn.BatchNorm1d(52)
-        self.bn2 = nn.BatchNorm1d(52)
-        self.bn3 = nn.BatchNorm1d(13)
-        
-        # Dropout layers
-        self.dropout = nn.Dropout(0.25)
-        
-    def forward(self, x: torch.Tensor, return_embedding: bool = False) -> torch.Tensor:
+    def forward(self, x):
         """
-        Forward pass through the network.
+        Forward pass
+        Args:
+            x: Input tensor of shape (batch_size, 1, n_mfcc, time_frames)
+        Returns:
+            Speaker embedding of shape (batch_size, embedding_dim)
+        """
+        # CNN feature extraction
+        x = F.relu(self.bn1(self.conv1(x)))
+        x = self.pool(x)
+        
+        x = F.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x)
+        
+        x = F.relu(self.bn3(self.conv3(x)))
+        x = self.adaptive_pool(x)
+        
+        # Flatten
+        x = x.view(x.size(0), -1)
+        
+        # Fully connected layers
+        x = F.relu(self.fc1(x))
+        x = self.dropout(x)
+        x = self.fc2(x)
+        
+        # L2 normalize for cosine similarity
+        x = F.normalize(x, p=2, dim=1)
+        
+        return x
+
+class SpeakerEmbeddingExtractor:
+    """Extract speaker embeddings from MFCC features"""
+    
+    def __init__(self, model_path: str = None):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = CNNSpeakerModel().to(self.device)
+        
+        if model_path:
+            self._load_model(model_path)
+        else:
+            # Initialize with random weights for demo
+            logger.info("Using randomly initialized speaker model for demo")
+        
+        self.model.eval()
+    
+    def _load_model(self, model_path: str):
+        """Load pre-trained model weights"""
+        try:
+            state_dict = torch.load(model_path, map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            logger.info(f"Loaded speaker model from {model_path}")
+        except Exception as e:
+            logger.error(f"Failed to load speaker model: {e}")
+            raise
+    
+    def extract_embedding(self, mfcc_features: np.ndarray) -> np.ndarray:
+        """
+        Extract speaker embedding from MFCC features
         
         Args:
-            x: Input tensor of shape (batch, 1, features, frames)
-            return_embedding: If True, return embedding only
-            
+            mfcc_features: MFCC features of shape (n_mfcc, time_frames)
+        
         Returns:
-            If return_embedding: speaker embedding
-            Else: (speaker_logits, scam_logits)
+            Speaker embedding vector
         """
-        # Input shape: (batch, 1, features, frames)
-        batch_size = x.shape[0]
-        
-        # Reshape if needed
-        if len(x.shape) == 4:
-            x = x.squeeze(1)  # Remove channel dim if present
-        
-        # Conv layer 1 with tanh activation (as per paper)
-        x = torch.tanh(self.conv1(x))
-        x = self.bn1(x)
-        x = self.dropout(x)
-        
-        # Conv layer 2
-        x = torch.tanh(self.conv2(x))
-        x = self.bn2(x)
-        x = self.dropout(x)
-        
-        # Conv layer 3
-        x = torch.tanh(self.conv3(x))
-        x = self.bn3(x)
-        x = self.dropout(x)
-        
-        # Attention across frames
-        # x shape: (batch, features=13, frames)
-        x = x.permute(0, 2, 1)  # (batch, frames, features)
-        
-        # Apply attention
-        attn_output, _ = self.attention(x, x, x)
-        x = attn_output.mean(dim=1)  # Average over frames
-        
-        # Flatten for scam detection
-        x = x.view(batch_size, -1)
-        
-        # Scam detection features
-        x = self.scam_detector(x)
-        
-        # Speaker embedding
-        embedding = self.speaker_embedding(x)
-        
-        if return_embedding:
+        try:
+            # Prepare input tensor
+            if len(mfcc_features.shape) == 2:
+                # Add batch and channel dimensions
+                mfcc_tensor = torch.FloatTensor(mfcc_features).unsqueeze(0).unsqueeze(0)
+            else:
+                raise ValueError(f"Expected 2D MFCC features, got shape {mfcc_features.shape}")
+            
+            mfcc_tensor = mfcc_tensor.to(self.device)
+            
+            # Extract embedding
+            with torch.no_grad():
+                embedding = self.model(mfcc_tensor)
+                embedding = embedding.cpu().numpy().flatten()
+            
             return embedding
-        
-        # Speaker classification
-        speaker_logits = self.speaker_classifier(embedding)
-        
-        # Scam classification
-        scam_logits = self.scam_classifier(embedding)
-        
-        return speaker_logits, scam_logits
+            
+        except Exception as e:
+            logger.error(f"Embedding extraction failed: {e}")
+            # Return zero embedding on failure
+            return np.zeros(self.model.embedding_dim)
     
-    def extract_embedding(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract speaker embedding from input features"""
-        return self.forward(x, return_embedding=True)
+    def compute_similarity(self, embedding1: np.ndarray, embedding2: np.ndarray) -> float:
+        """Compute cosine similarity between two embeddings"""
+        try:
+            # Normalize embeddings
+            norm1 = np.linalg.norm(embedding1)
+            norm2 = np.linalg.norm(embedding2)
+            
+            if norm1 == 0 or norm2 == 0:
+                return 0.0
+            
+            # Cosine similarity
+            similarity = np.dot(embedding1, embedding2) / (norm1 * norm2)
+            return float(similarity)
+            
+        except Exception as e:
+            logger.error(f"Similarity computation failed: {e}")
+            return 0.0
     
-    def predict_scam(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predict if audio is from a scammer"""
-        speaker_logits, scam_logits = self.forward(x)
-        scam_probs = F.softmax(scam_logits, dim=-1)
-        return scam_probs[:, 1]  # Probability of being scam
+    def get_model_info(self) -> Dict:
+        """Get model information"""
+        return {
+            "model_type": "CNN Speaker Recognition",
+            "embedding_dim": self.model.embedding_dim,
+            "input_dim": self.model.input_dim,
+            "device": str(self.device),
+            "parameters": sum(p.numel() for p in self.model.parameters())
+        }
